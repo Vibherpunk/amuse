@@ -25,7 +25,8 @@ export function encrypt(plain: string): string {
 
 export function decrypt(blob: string): string {
   const [iv, tag, enc] = blob.split(".").map((s) => Buffer.from(s, "base64"));
-  const decipher = crypto.createDecipheriv("aes-256-gcm", key(), iv!);
+  if (iv?.length !== 12 || tag?.length !== 16) throw new Error("Malformed encrypted value");
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key(), iv, { authTagLength: 16 });
   decipher.setAuthTag(tag!);
   return Buffer.concat([decipher.update(enc!), decipher.final()]).toString("utf8");
 }
@@ -100,12 +101,14 @@ const SERVICE_HOSTS: Record<string, string> = {
   trello: "api.trello.com",
 };
 
+const SERVICE_PATTERNS = Object.entries(SERVICE_HOSTS).map(([service, official]) => ({ service, official, pattern: new RegExp(`\\b${service}\\b`, "i") }));
+
 export function credentialDestination(label: string, host?: string | null, baseUrl?: string | null): string {
   const destination = normalizeHost(baseUrl || host);
   if (!destination) throw new Error("A valid credential destination host is required.");
   if (host && baseUrl && normalizeHost(host) !== destination) throw new Error("Host and API base URL must name the same destination.");
-  for (const [service, official] of Object.entries(SERVICE_HOSTS)) {
-    if (new RegExp(`\\b${service}\\b`, "i").test(label) && destination !== official && !destination.endsWith("." + official)) {
+  for (const { service, official, pattern } of SERVICE_PATTERNS) {
+    if (pattern.test(label) && destination !== official && !destination.endsWith("." + official)) {
       throw new Error(`${service} credentials must use ${official}, not ${destination}.`);
     }
   }

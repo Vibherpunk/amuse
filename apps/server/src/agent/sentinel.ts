@@ -58,8 +58,19 @@ export function recordTrustedUrls(runId: number, urls: string[]) {
   }
   trustedUrls.set(runId, known);
 }
+const HOST_TOKEN = /^(?:[a-z0-9-]{1,63}\.){1,10}[a-z]{2,63}$/;
+
+/** Hostnames mentioned in text, found token by token so the pattern can't backtrack across the whole message. */
+export function hostsIn(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9.-]+/)
+    .map((t) => t.replace(/^[.-]+|[.-]+$/g, ""))
+    .filter((t) => t.length <= 253 && HOST_TOKEN.test(t));
+}
+
 export function userNamedHosts(messages: string[]): Set<string> {
-  return new Set(messages.flatMap((text) => (text.match(/(?:[a-z0-9-]+\.)+[a-z]{2,}/gi) ?? []).map((h) => h.toLowerCase())));
+  return new Set(messages.flatMap(hostsIn));
 }
 export function userNamedUrls(messages: string[]): Set<string> {
   const urls = new Set<string>();
@@ -148,8 +159,7 @@ export function carriesPrivatePayload(url: string, body: unknown, message: strin
   } catch {
     return false;
   }
-  const named = (message.match(/(?:[a-z0-9-]+\.)+[a-z]{2,}/gi) ?? []).map((s) => s.toLowerCase());
-  if (named.includes(u.hostname.toLowerCase())) return false;
+  if (hostsIn(message).includes(u.hostname.toLowerCase())) return false;
   const payload = u.search + (body == null ? "" : JSON.stringify(body));
   return payload.length > 100 || /(?:%[0-9a-f]{2}){8,}|[A-Za-z0-9+/=_-]{40,}/i.test(payload);
 }
