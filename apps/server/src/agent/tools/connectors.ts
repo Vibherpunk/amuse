@@ -375,13 +375,15 @@ function parseIcsDate(v: string) {
   return new Date(`${y}-${mo}-${d}T${h}:${mi}:${s}${z ? "Z" : ""}`);
 }
 
+const ICS_FIELDS = Object.fromEntries(["DTSTART", "DTEND", "SUMMARY", "LOCATION"].map((k) => [k, new RegExp(`\\n${k}[^:\\n]*:([^\\n]*)`)]));
+
 export function parseIcs(ics: string, days: number) {
   const now = Date.now();
   const end = now + days * 86400000;
   const unfolded = ics.replace(/\r?\n[ \t]/g, "");
   const out: { title: string; start: string; end?: string; location?: string }[] = [];
   for (const block of unfolded.split("BEGIN:VEVENT").slice(1)) {
-    const get = (k: string) => block.match(new RegExp(`\\n${k}[^:\\n]*:([^\\n]*)`))?.[1]?.trim();
+    const get = (k: keyof typeof ICS_FIELDS) => block.match(ICS_FIELDS[k]!)?.[1]?.trim();
     const start = parseIcsDate(get("DTSTART") ?? "");
     if (!start) continue;
     const t = start.getTime();

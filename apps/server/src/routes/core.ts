@@ -159,7 +159,7 @@ router.post("/agent/hatch", async (req, res) => {
 router.patch("/agent", async (req, res) => {
   const userId = uid(req);
   const patch: Record<string, unknown> = {};
-  for (const k of ["name", "vibe", "emoji", "avatarUrl", "avatarStyle", "proactivity"]) if (k in (req.body ?? {})) patch[k] = req.body[k];
+  for (const k of ["name", "vibe", "emoji", "avatarUrl", "avatarStyle", "proactivity"]) if (Object.hasOwn(req.body ?? {}, k)) patch[k] = req.body[k];
   if (Object.keys(patch).length) await db.update(agentsTable).set(patch).where(eq(agentsTable.userId, userId));
   if (patch.name || patch.vibe || patch.emoji) {
     const [a] = await db.select().from(agentsTable).where(eq(agentsTable.userId, userId));
@@ -482,7 +482,7 @@ router.get("/settings", async (req, res) => {
 
 router.patch("/settings", async (req, res) => {
   const patch: Record<string, unknown> = {};
-  for (const k of ["connectorDefault", "webDefault", "notifications", "voice", "timezone"]) if (k in (req.body ?? {})) patch[k] = req.body[k];
+  for (const k of ["connectorDefault", "webDefault", "notifications", "voice", "timezone"]) if (Object.hasOwn(req.body ?? {}, k)) patch[k] = req.body[k];
   if (Object.keys(patch).length)
     await db
       .update(settingsTable)

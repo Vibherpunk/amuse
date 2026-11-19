@@ -72,12 +72,12 @@ router.get("/artifacts/:id", async (req, res) => {
  * can't navigate to another site (by script, link or meta refresh) to carry data out. Opening one
  * directly in a tab gets a minimal parent page that frames it.
  */
-function servedFramed(req: Request, res: Response) {
+function servedFramed(req: Request, res: Response, src: string) {
   if (req.get("sec-fetch-dest") !== "document") return false;
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; frame-src 'self'");
   res.send(
-    `<!doctype html><meta charset="utf-8"><title>Amuse</title><style>html,body,iframe{margin:0;height:100%;width:100%;border:0;display:block}</style><iframe src="${req.originalUrl.replace(/"/g, "&quot;")}" sandbox="allow-scripts allow-forms"></iframe>`,
+    `<!doctype html><meta charset="utf-8"><title>Amuse</title><style>html,body,iframe{margin:0;height:100%;width:100%;border:0;display:block}</style><iframe src="${src}" sandbox="allow-scripts allow-forms"></iframe>`,
   );
   return true;
 }
@@ -105,7 +105,7 @@ router.get("/artifacts/:id/raw", async (req, res) => {
     return;
   }
   if (a.kind === "html") {
-    if (servedFramed(req, res)) return;
+    if (servedFramed(req, res, `/api/artifacts/${a.id}/raw`)) return;
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("Content-Security-Policy", SANDBOX_CSP);
     res.send(wrapHtml(a.content, bridge("artifact", a.id, (a.meta as any)?.data ?? {})));
@@ -197,7 +197,7 @@ router.get("/spaces/:id/raw", async (req, res) => {
     res.status(404).end();
     return;
   }
-  if (servedFramed(req, res)) return;
+  if (servedFramed(req, res, `/api/spaces/${s.id}/raw`)) return;
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Content-Security-Policy", SANDBOX_CSP);
   res.send(wrapHtml(s.html, bridge("space", s.id, s.data)));
@@ -213,7 +213,7 @@ router.put("/spaces/:id/data", async (req, res) => {
 
 router.patch("/spaces/:id", async (req, res) => {
   const patch: Record<string, unknown> = {};
-  for (const k of ["title", "emoji", "placement", "schedule", "position"]) if (k in (req.body ?? {})) patch[k] = req.body[k];
+  for (const k of ["title", "emoji", "placement", "schedule", "position"]) if (Object.hasOwn(req.body ?? {}, k)) patch[k] = req.body[k];
   if (patch.placement && !["sidebar", "tab", "hidden"].includes(String(patch.placement))) {
     res.status(400).end();
     return;
@@ -296,7 +296,7 @@ router.post("/connectors/:provider", async (req, res) => {
       return;
     }
   }
-  if (API_PRESETS[provider]) Object.assign(config, API_PRESETS[provider]);
+  if (Object.hasOwn(API_PRESETS, provider)) Object.assign(config, API_PRESETS[provider]);
   const cred = secret ? await storeCredential(userId, { label: `${item.name} credential`, kind: "api_key", host: provider, secret }) : null;
   await db
     .insert(connectorsTable)
