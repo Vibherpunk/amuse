@@ -473,3 +473,31 @@ export async function publicFetch(url: string, init: RequestInit = {}, opts: { s
   }
   throw new Error("Too many redirects");
 }
+
+/**
+ * fetch() for owner-configured custom connector base URLs. Unlike publicFetch this does NOT
+ * require a public address: the person explicitly configured the destination in Settings (e.g.
+ * a tailnet or LAN service like Windmill), so normal DNS resolution is used. Redirects are
+ * only followed within the same origin, so a connector response can never bounce the request
+ * (or a credential riding on it) to a different destination. Only the connector tool path
+ * uses this, and only for URLs inside the connector's own configured base URL; browser and
+ * web egress keep using publicFetch.
+ */
+export async function connectorFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  let current = url;
+  let req: RequestInit = init;
+  const origin = new URL(url).origin;
+  for (let hop = 0; hop < 5; hop++) {
+    const res = await undiciFetch(current, { ...(req as Parameters<typeof undiciFetch>[1]), redirect: "manual" });
+    const loc = res.headers.get("location");
+    if (res.status < 300 || res.status >= 400 || !loc) return res as unknown as Response;
+    const next = new URL(loc, current);
+    if (next.origin !== origin) return res as unknown as Response;
+    const method = (req.method ?? "GET").toUpperCase();
+    // Per the fetch spec: 303 becomes GET (except HEAD); 301/302 only rewrite POST. 307/308 keep everything.
+    if ((res.status === 303 && method !== "HEAD") || ((res.status === 301 || res.status === 302) && method === "POST"))
+      req = { ...req, method: "GET", body: undefined };
+    current = next.href;
+  }
+  throw new Error("Too many redirects");
+}

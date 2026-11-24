@@ -1,7 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Link, useLocation } from "wouter";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Library, Lightbulb, Menu, MessageCircle, Newspaper, Plus, Search, Settings, SquareCheckBig, LayoutGrid, Target } from "lucide-react";
+import { FileText, Library, Lightbulb, Menu, MessageCircle, Newspaper, Plus, Search, Settings, SquareCheckBig, LayoutGrid, Target } from "lucide-react";
 import { api } from "../lib/api";
 import type { Me, Space } from "../lib/types";
 import { AgentPanel, usePanel } from "./AgentPanel";
@@ -64,6 +64,8 @@ export function AppShell({ me, children }: { me: Me; children: ReactNode }) {
         [["goals"], "/goals"],
         [["ideas"], "/ideas"],
         [["library", "all"], "/library"],
+        [["spaces"], "/spaces"],
+        [["docs"], "/docs"],
         [["chats"], "/chats"],
         [["settings"], "/settings"],
       ] as const)
@@ -84,6 +86,7 @@ export function AppShell({ me, children }: { me: Me; children: ReactNode }) {
           <RailItem href="/ideas" icon={<Lightbulb size={19} />} label="Ideas" active={loc.startsWith("/ideas")} testid="nav-ideas" />
           <RailItem href="/goals" icon={<SquareCheckBig size={19} />} label="Goals" active={loc.startsWith("/goals")} testid="nav-goals" />
           <RailItem href="/spaces" icon={<LayoutGrid size={19} />} label="Spaces" active={loc === "/spaces"} testid="nav-spaces" />
+          <RailItem href="/docs" icon={<FileText size={19} />} label="Docs" active={loc.startsWith("/docs")} testid="nav-docs" />
           <RailItem href="/library" icon={<Library size={19} />} label="Library" active={loc.startsWith("/library")} testid="nav-library" />
           {spaces.length > 0 && <div className="my-1 h-px w-6 bg-[var(--line)]" />}
           {spaces.slice(0, 6).map((s) => (
@@ -142,6 +145,7 @@ function MobileNav({ loc, isChat, tabSpaces }: { loc: string; isChat: boolean; t
   const extra = [
     { href: "/feed", label: "Feed", icon: <Newspaper size={18} /> },
     { href: "/spaces", label: "Spaces", icon: <LayoutGrid size={18} /> },
+    { href: "/docs", label: "Docs", icon: <FileText size={18} /> },
     { href: "/library", label: "Library", icon: <Library size={18} /> },
     { href: "/settings", label: "Settings", icon: <Settings size={18} /> },
   ];

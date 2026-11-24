@@ -46,6 +46,7 @@ export function EventsProvider({ children, initialStatus }: { children: ReactNod
             upcoming: ["upcoming"],
             files: ["files"],
             agent: ["me"],
+            docs: ["docs", "doc"],
           };
           for (const k of map[e.what] ?? []) qc.invalidateQueries({ queryKey: [k] });
         }

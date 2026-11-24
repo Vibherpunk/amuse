@@ -27,3 +27,8 @@ Thumbs.db
 
 # speech voices copied at runtime
 apps/server/voices/
+
+# local backups and pre-git backup snapshots
+backups/
+*.bak
+*.bak-*

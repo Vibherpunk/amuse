@@ -20,6 +20,16 @@ const LABEL: Record<Phase, string> = {
   error: "Something's wrong",
 };
 
+const cleanForSpeech = (s: string) =>
+  s
+    .replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, "")
+    .replace(/^>>.*$/gm, "")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/[#*_`>|]/g, "")
+    .replace(/\p{Extended_Pictographic}/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
 const inFrame = (() => {
   try {
     return window.self !== window.top;
@@ -57,6 +67,12 @@ export function VoiceMode({
   const mutedRef = useRef(false);
   const stopper = useRef<{ stop?: () => void }>({});
   const playback = useRef<{ stopped: boolean; current?: AudioBufferSourceNode }>({ stopped: false });
+  const streamBuf = useRef("");
+  const streamRaw = useRef("");
+  const streamUsed = useRef(false);
+  const streamDone = useRef(false);
+  const streamPlaying = useRef(false);
+  const streamQueue = useRef<Promise<ArrayBuffer | null>[]>([]);
   const emptyStreak = useRef(0);
   const phaseRef = useRef<Phase>("connecting");
   const engineRef = useRef(voiceEngine());
@@ -71,6 +87,12 @@ export function VoiceMode({
 
   const sendUtterance = async (text: string) => {
     emptyStreak.current = 0;
+    streamBuf.current = "";
+    streamRaw.current = "";
+    streamUsed.current = false;
+    streamDone.current = false;
+    streamPlaying.current = false;
+    streamQueue.current = [];
     setYou(text);
     setReply("");
     setStatus("");
@@ -181,7 +203,7 @@ export function VoiceMode({
         if (!spoke) setHint("I'm hearing you…");
         spoke = true;
       }
-      if (spoke && Date.now() - lastLoud > 1100) stopper.current.stop?.();
+      if (spoke && Date.now() - lastLoud > 750) stopper.current.stop?.();
       if (!spoke && Date.now() - startedAt > 15000) stopper.current.stop?.();
     }, 80);
     const r = await recordToBase64(stream, 30000, stopper.current);
@@ -249,8 +271,67 @@ export function VoiceMode({
     if (active.current && !playback.current.stopped) void listen();
   };
 
+  const drainStreamQueue = async () => {
+    if (streamPlaying.current) return;
+    streamPlaying.current = true;
+    playback.current = { stopped: false };
+    try {
+      const ac = callAudio();
+      await ac.resume().catch(() => undefined);
+      while (active.current && !playback.current.stopped) {
+        const next = streamQueue.current.shift();
+        if (!next) {
+          if (streamDone.current) break;
+          await new Promise((r) => setTimeout(r, 40));
+          continue;
+        }
+        const buf = await next;
+        if (!buf || !active.current || playback.current.stopped) continue;
+        const decoded = await ac.decodeAudioData(buf.slice(0));
+        if (!active.current || playback.current.stopped) break;
+        if (phaseRef.current !== "speaking") go("speaking");
+        await new Promise<void>((resolve) => {
+          const src = ac.createBufferSource();
+          src.buffer = decoded;
+          src.connect(ac.destination);
+          playback.current.current = src;
+          setLevel(0.6);
+          src.onended = () => {
+            setLevel(0);
+            resolve();
+          };
+          src.start();
+        });
+      }
+    } finally {
+      streamPlaying.current = false;
+      setLevel(0);
+      if (active.current && !playback.current.stopped && streamDone.current) void listen();
+    }
+  };
+
+  const enqueueClause = (rawClause: string) => {
+    const clean = cleanForSpeech(rawClause);
+    if (!clean) return;
+    streamUsed.current = true;
+    if (phaseRef.current === "thinking") go("preparing");
+    const p = fetch("/api/voice/speak", {
+      method: "POST",
+      credentials: "include",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: clean, voice }),
+    })
+      .then((resp) => (resp.ok ? resp.arrayBuffer() : null))
+      .catch(() => null);
+    streamQueue.current.push(p);
+    void drainStreamQueue();
+  };
+
   const interrupt = () => {
     playback.current.stopped = true;
+    streamQueue.current = [];
+    streamBuf.current = "";
+    streamDone.current = true;
     try {
       playback.current.current?.stop();
     } catch {
@@ -275,18 +356,37 @@ export function VoiceMode({
     async (e) => {
       if (!active.current) return;
       if (e.type === "status" && phaseRef.current === "thinking") return setStatus(String(e.status ?? ""));
+      if (e.type === "delta" && e.chatId === chatId && pendingMsg.current != null && engineRef.current !== "device") {
+        const chunk = String(e.text ?? "");
+        streamRaw.current += chunk;
+        streamBuf.current += chunk;
+        setReply(streamRaw.current.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, "").trim().slice(0, 1200));
+        const opens = (streamRaw.current.match(/<think>/gi) ?? []).length;
+        const closes = (streamRaw.current.match(/<\/think>/gi) ?? []).length;
+        if (opens > closes) return;
+        streamBuf.current = streamBuf.current.replace(/<think>[\s\S]*?<\/think>/gi, "");
+        while (true) {
+          const m = streamBuf.current.match(/^(.*?[.!?](?:\s+|$)|.*?\n)/s);
+          if (!m || m[0].trim().length < 20) break;
+          const clause = m[0];
+          streamBuf.current = streamBuf.current.slice(clause.length);
+          enqueueClause(clause);
+        }
+        return;
+      }
       if (e.type !== "message_done" || e.chatId !== chatId || pendingMsg.current == null) return;
       pendingMsg.current = null;
+      if (streamUsed.current) {
+        const tail = streamBuf.current.trim();
+        streamBuf.current = "";
+        if (tail) enqueueClause(tail);
+        streamDone.current = true;
+        void drainStreamQueue();
+        return;
+      }
       const r = await fetch(`/api/chats/${chatId}/messages`, { credentials: "include" }).then((x) => x.json());
       const last = [...r.messages].reverse().find((m: any) => m.role === "assistant");
-      const say =
-        (last?.content ?? "")
-          .replace(/^>>.*$/gm, "")
-          .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-          .replace(/[#*_`>|]/g, "")
-          .replace(/\p{Extended_Pictographic}/gu, "")
-          .trim()
-          .slice(0, 1200) || "Done.";
+      const say = cleanForSpeech(last?.content ?? "").slice(0, 1200) || "Done.";
       await speak(say);
     },
     [chatId, voice],
@@ -315,6 +415,11 @@ export function VoiceMode({
       active.current = false;
       stopper.current.stop?.();
       playback.current.stopped = true;
+      streamQueue.current = [];
+      streamBuf.current = "";
+      streamRaw.current = "";
+      streamDone.current = true;
+      streamUsed.current = false;
       try {
         playback.current.current?.stop();
       } catch {

@@ -202,6 +202,7 @@ export const scheduledTasksTable = pgTable(
     enabled: boolean("enabled").notNull().default(true),
     goalId: integer("goal_id"),
     spaceId: integer("space_id"),
+    trackingItemId: integer("tracking_item_id"),
     createdAt: ts("created_at").notNull().defaultNow(),
   },
   (t) => [index("sched_due").on(t.enabled, t.nextRunAt)],
@@ -351,3 +352,142 @@ export const browserSessionsTable = pgTable("browser_sessions", {
   createdAt: ts("created_at").notNull().defaultNow(),
   updatedAt: ts("updated_at").notNull().defaultNow(),
 });
+
+/** Owner-managed MCP servers (Settings -> MCP servers). */
+export const mcpServersTable = pgTable(
+  "mcp_servers",
+  {
+    id: serial("id").primaryKey(),
+    userId: userRef(),
+    name: varchar("name", { length: 60 }).notNull(),
+    transport: varchar("transport", { length: 16 }).notNull().default("http"),
+    url: text("url").notNull(),
+    authType: varchar("auth_type", { length: 16 }).notNull().default("none"), // none | bearer | custom
+    authHeader: text("auth_header"),
+    credentialId: integer("credential_id"),
+    allowlist: jsonb("allowlist").$type<string[] | null>().default(null),
+    enabled: boolean("enabled").notNull().default(true),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("mcp_servers_user_name").on(t.userId, t.name)],
+);
+
+/** Tracked real-world commitments, open questions, and upcoming meetings/trips. */
+export const trackingItemsTable = pgTable(
+  "tracking_items",
+  {
+    id: serial("id").primaryKey(),
+    userId: userRef(),
+    kind: varchar("kind", { length: 16 }).notNull().default("todo"), // todo | question | meeting
+    content: text("content").notNull(),
+    dueAt: ts("due_at"),
+    dueText: text("due_text"),
+    status: varchar("status", { length: 16 }).notNull().default("open"), // open | done | cancelled
+    revision: integer("revision").notNull().default(1),
+    sourceRef: text("source_ref"),
+    idempotencyKey: text("idempotency_key"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [index("tracking_items_user_status").on(t.userId, t.status), uniqueIndex("tracking_items_user_idem").on(t.userId, t.idempotencyKey)],
+);
+
+/** Deduplication log for polled external events (Gmail, Calendar, Chat review, Meetings). */
+export const proactiveEventsTable = pgTable(
+  "proactive_events",
+  {
+    id: serial("id").primaryKey(),
+    userId: userRef(),
+    source: varchar("source", { length: 24 }).notNull(), // gmail | calendar | chat | meeting | chat_review_cursor
+    externalKey: text("external_key").notNull(),
+    stateHash: varchar("state_hash", { length: 64 }).notNull(),
+    dayKey: varchar("day_key", { length: 10 }).notNull(),
+    status: varchar("status", { length: 16 }).notNull().default("seen"), // seen | judged | notified | suppressed
+    payload: jsonb("payload").$type<Record<string, unknown>>().notNull().default({}),
+    createdAt: ts("created_at").notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("proactive_events_dedupe").on(t.userId, t.source, t.externalKey, t.stateHash, t.dayKey)],
+);
+
+/** Proactive messages delivered to the user, read nightly by proactive dreaming. */
+export const proactiveDeliveriesTable = pgTable(
+  "proactive_deliveries",
+  {
+    id: serial("id").primaryKey(),
+    userId: userRef(),
+    source: varchar("source", { length: 32 }).notNull(),
+    messageId: integer("message_id").notNull(),
+    trackingItemId: integer("tracking_item_id"),
+    summary: text("summary").notNull().default(""),
+    dreamedAt: ts("dreamed_at"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+  },
+  (t) => [index("proactive_deliveries_user_day").on(t.userId, t.createdAt)],
+);
+
+/** Clues extracted by nightly proactive dreaming (14-day TTL, promoted at seen >= 2). */
+export const proactiveCluesTable = pgTable(
+  "proactive_clues",
+  {
+    id: serial("id").primaryKey(),
+    userId: userRef(),
+    matter: text("matter").notNull(),
+    kind: varchar("kind", { length: 64 }).notNull(),
+    timeWindow: varchar("time_window", { length: 64 }),
+    leaning: varchar("leaning", { length: 24 }).notNull().default("follow_up_later"), // tell_now | follow_up_later | stay_silent
+    seen: integer("seen").notNull().default(1),
+    lastSeenAt: ts("last_seen_at").notNull().defaultNow(),
+    createdAt: ts("created_at").notNull().defaultNow(),
+  },
+  (t) => [index("proactive_clues_user").on(t.userId, t.lastSeenAt)],
+);
+
+/** Versioned learned rules for rollback and auditability. */
+export const proactiveRuleVersionsTable = pgTable(
+  "proactive_rule_versions",
+  {
+    id: serial("id").primaryKey(),
+    userId: userRef(),
+    version: integer("version").notNull(),
+    rules: jsonb("rules").$type<string[]>().notNull().default([]),
+    rationale: text("rationale").notNull().default(""),
+    createdAt: ts("created_at").notNull().defaultNow(),
+  },
+  (t) => [index("proactive_rule_versions_user").on(t.userId, t.version)],
+);
+
+export type DocBlockType = "p" | "h1" | "h2" | "h3" | "bullet" | "todo" | "callout" | "quote" | "code" | "divider";
+
+export interface DocComment {
+  id: string;
+  author: "user" | "agent";
+  text: string;
+  selection?: string;
+  createdAt: string;
+  resolved?: boolean;
+}
+
+export interface DocBlock {
+  id: string;
+  type: DocBlockType;
+  text: string;
+  checked?: boolean;
+  comments?: DocComment[];
+}
+
+/** Native Notion-style collaborative documents editable by user & Amuse. */
+export const documentsTable = pgTable(
+  "documents",
+  {
+    id: serial("id").primaryKey(),
+    userId: userRef(),
+    title: text("title").notNull().default("Untitled"),
+    emoji: varchar("emoji", { length: 16 }).notNull().default("📝"),
+    slug: varchar("slug", { length: 120 }).notNull(),
+    blocks: jsonb("blocks").$type<DocBlock[]>().notNull().default([]),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [index("documents_user_updated").on(t.userId, t.updatedAt)],
+);

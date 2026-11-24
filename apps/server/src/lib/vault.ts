@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { and, eq } from "drizzle-orm";
-import { approvalsTable, connectorsTable, credentialsTable, db } from "@amuse/db";
+import { approvalsTable, connectorsTable, credentialsTable, db, mcpServersTable } from "@amuse/db";
 import { secretKey } from "./config";
 
 /**
@@ -70,7 +70,37 @@ export async function deleteCredential(userId: string, id: number) {
   await db.delete(credentialsTable).where(and(eq(credentialsTable.userId, userId), eq(credentialsTable.id, id)));
 }
 
-/** The hosts a credential may be sent to: its own host plus the base URL of any connector that uses it. */
+export async function updateCredential(
+  userId: string,
+  id: number,
+  input: { label?: string; host?: string | null; username?: string | null; secret?: string; kind?: string },
+) {
+  const [existing] = await db
+    .select()
+    .from(credentialsTable)
+    .where(and(eq(credentialsTable.userId, userId), eq(credentialsTable.id, id)));
+  if (!existing) return null;
+  const patch: Partial<typeof credentialsTable.$inferInsert> = {};
+  if (input.label !== undefined) patch.label = input.label;
+  if (input.host !== undefined) patch.host = normalizeHost(input.host) ?? input.host ?? null;
+  if (input.username !== undefined) patch.username = input.username;
+  if (input.kind !== undefined) patch.kind = input.kind;
+  if (typeof input.secret === "string" && input.secret.length > 0) patch.secretEnc = encrypt(input.secret);
+  if (!Object.keys(patch).length) {
+    const { secretEnc: _s, surrogate: _sur, ...safe } = existing;
+    return safe;
+  }
+  const [updated] = await db
+    .update(credentialsTable)
+    .set(patch)
+    .where(and(eq(credentialsTable.userId, userId), eq(credentialsTable.id, id)))
+    .returning();
+  if (!updated) return null;
+  const { secretEnc: _s, surrogate: _sur, ...safe } = updated;
+  return safe;
+}
+
+/** The hosts a credential may be sent to: its own host plus the base URL of any connector or MCP server that uses it. */
 async function credentialHosts(userId: string, row: typeof credentialsTable.$inferSelect): Promise<string[]> {
   const hosts = new Set<string>();
   const own = normalizeHost(row.host);
@@ -83,7 +113,51 @@ async function credentialHosts(userId: string, row: typeof credentialsTable.$inf
     const h = normalizeHost(typeof c.config.baseUrl === "string" ? c.config.baseUrl : null);
     if (h) hosts.add(h);
   }
+  try {
+    const mcps = await db
+      .select()
+      .from(mcpServersTable)
+      .where(and(eq(mcpServersTable.userId, userId), eq(mcpServersTable.credentialId, row.id)));
+    for (const s of mcps) {
+      const h = normalizeHost(s.url);
+      if (h) hosts.add(h);
+    }
+  } catch {
+    // Allow isolated unit tests without Postgres mcp_servers table.
+  }
   return [...hosts];
+}
+
+export async function resolveVaultAuthHeader(
+  userId: string,
+  credentialId: number,
+  destinationHost: string,
+  authType: "bearer" | "custom",
+  authHeaderTemplate?: string | null,
+): Promise<{ name: string; value: string }> {
+  const [cred] = await db
+    .select()
+    .from(credentialsTable)
+    .where(and(eq(credentialsTable.userId, userId), eq(credentialsTable.id, credentialId)));
+  if (!cred) throw new Error("Selected vault login no longer exists.");
+  if (authType === "bearer") {
+    const substituted = await substituteAuthHeader(userId, `Bearer ${cred.surrogate}`, destinationHost);
+    const value = substituted.text.replace(/^Bearer\s+Bearer\s+/i, "Bearer ");
+    return { name: "Authorization", value };
+  }
+  const rawTpl = String(authHeaderTemplate ?? "").trim();
+  if (!rawTpl || /[\x00-\x1f\x7f]/.test(rawTpl)) throw new Error("Invalid custom header template.");
+  const tpl = rawTpl.includes(":") ? rawTpl : `${rawTpl}: {token}`;
+  const idx = tpl.indexOf(":");
+  const headerName = tpl.slice(0, idx).trim();
+  if (!/^[A-Za-z0-9-]+$/.test(headerName)) throw new Error(`Invalid header name "${headerName}".`);
+  const tplVal = tpl.slice(idx + 1).trim();
+  if (!tplVal.includes("{token}")) throw new Error("Header template must contain {token} where the credential goes.");
+  const rawVal = /^basic\s/i.test(tplVal)
+    ? "Basic " + Buffer.from(`${cred.username ?? ""}:${cred.surrogate}`, "utf8").toString("base64")
+    : tplVal.replace("{token}", cred.surrogate);
+  const substituted = await substituteAuthHeader(userId, rawVal, destinationHost);
+  return { name: headerName, value: substituted.text };
 }
 
 export const hostMatches = (dest: string, allowed: string) => dest === allowed;

@@ -87,6 +87,8 @@ export async function ensureUserSetup(userId: string) {
   if (!main) {
     await db.insert(chatsTable).values({ userId, kind: "main", title: "Main" });
   }
+  const { ensureProactiveSetup } = await import("./proactive");
+  await ensureProactiveSetup(userId);
 }
 
 export async function getMainChatId(userId: string): Promise<number> {

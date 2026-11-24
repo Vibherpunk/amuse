@@ -84,3 +84,43 @@ export interface Chat {
   title: string;
   updatedAt: string;
 }
+
+export type DocBlockType = "p" | "h1" | "h2" | "h3" | "bullet" | "todo" | "callout" | "quote" | "code" | "divider";
+
+export interface DocComment {
+  id: string;
+  author: "user" | "agent";
+  text: string;
+  selection?: string;
+  createdAt: string;
+  resolved?: boolean;
+}
+
+export interface DocBlock {
+  id: string;
+  type: DocBlockType;
+  text: string;
+  checked?: boolean;
+  comments?: DocComment[];
+}
+
+export interface DocSummary {
+  id: number;
+  title: string;
+  emoji: string;
+  slug: string;
+  updatedAt: string;
+  createdAt: string;
+  blockCount: number;
+  preview: string;
+}
+
+export interface CollaborativeDoc {
+  id: number;
+  title: string;
+  emoji: string;
+  slug: string;
+  blocks: DocBlock[];
+  createdAt: string;
+  updatedAt: string;
+}

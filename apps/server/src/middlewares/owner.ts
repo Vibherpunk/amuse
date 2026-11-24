@@ -23,7 +23,7 @@ export function ownerMiddleware(req: Request, _res: Response, next: NextFunction
  * so other websites open in your browser (including DNS-rebinding tricks and sandboxed frames)
  * can't drive your agent.
  */
-const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "your-mac.local"]);
 const hostname = (host: string) => host.toLowerCase().replace(/:\d+$/, "");
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 

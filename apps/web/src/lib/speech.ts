@@ -70,7 +70,7 @@ export function deviceVoiceAvailable() {
 export function voiceEngine(): VoiceEngine {
   const v = typeof localStorage !== "undefined" ? localStorage.getItem(ENGINE_KEY) : null;
   if (v === "natural" || (v === "device" && deviceVoiceAvailable())) return v;
-  return deviceVoiceAvailable() ? "device" : "natural";
+  return "natural";
 }
 export function setVoiceEngine(v: VoiceEngine) {
   localStorage.setItem(ENGINE_KEY, v);

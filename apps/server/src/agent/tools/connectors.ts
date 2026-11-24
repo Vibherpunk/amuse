@@ -1,7 +1,7 @@
 import { and, eq } from "drizzle-orm";
 import { connectorsTable, credentialsTable, db, messagesTable } from "@amuse/db";
 import { publish } from "../bus";
-import { check, hostOf, isPublicUrl, markUntrustedRead, publicFetch } from "../sentinel";
+import { check, connectorFetch, hostOf, isPublicHost, isPublicUrl, markUntrustedRead, publicFetch } from "../sentinel";
 import {
   authHeaderText,
   credentialDestination,
@@ -89,12 +89,24 @@ export const connectorTools: ToolDef[] = [
         instructions: str("Short steps for where to find it"),
         base_url: str("API base URL for a custom connector"),
         header: str("Header template, e.g. 'Authorization: Bearer {token}'"),
+        auth: str("Auth style: 'basic' when the service signs in with a username & password (HTTP Basic); omit otherwise"),
       },
       ["label", "instructions"],
     ),
     async run(a, ctx) {
       const host = credentialDestination(a.label, a.host, a.base_url);
-      ctx.addParts([{ type: "credential_card", label: a.label, host, instructions: a.instructions, baseUrl: a.base_url ?? null, header: a.header ?? null }]);
+      const basic = a.auth === "basic";
+      ctx.addParts([
+        {
+          type: "credential_card",
+          label: a.label,
+          host,
+          instructions: a.instructions,
+          baseUrl: a.base_url ?? null,
+          header: basic ? "Authorization: Basic {token}" : (a.header ?? null),
+          auth: basic ? "basic" : null,
+        },
+      ]);
       return { shown_to_person: true, note: "Stop here and tell them a secure card is waiting. When they submit it you'll get a surrogate token to use." };
     },
   },
@@ -118,7 +130,29 @@ export const connectorTools: ToolDef[] = [
       const c = a.provider ? await getConnector(ctx.userId, a.provider) : null;
       const base = (c?.config as any)?.baseUrl as string | undefined;
       const url = /^https?:/.test(a.path) ? a.path : (base ?? "").replace(/\/$/, "") + "/" + String(a.path).replace(/^\//, "");
-      if (!isPublicUrl(url)) return { error: "Not a public URL" };
+      // A custom connector's traffic is scoped to the base URL the person configured for
+      // it in Settings: same origin AND within the base URL's path prefix. The destination
+      // was chosen by the owner, not the model — that scoping is what lets custom connectors
+      // reach tailnet/LAN services (e.g. Windmill) that the public-egress guard would refuse.
+      // The relaxed fetch (no DNS pinning) applies only when the base host is private;
+      // a public-host custom connector goes through publicFetch like everything else.
+      let scoped = false;
+      let relaxed = false;
+      if (c?.custom && base) {
+        try {
+          const u = new URL(url);
+          const b = new URL(base);
+          const basePath = b.pathname.replace(/\/$/, "");
+          scoped = u.origin === b.origin && (basePath === "" || u.pathname === basePath || u.pathname.startsWith(basePath + "/"));
+          const bh = b.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+          relaxed = scoped && (bh.endsWith(".ts.net") || !isPublicHost(bh));
+        } catch {
+          scoped = false;
+          relaxed = false;
+        }
+        if (!scoped) return { error: "Custom connector requests must stay within the connector's base URL." };
+      }
+      if (!scoped && !isPublicUrl(url)) return { error: "Not a public URL" };
       const host = new URL(url).hostname;
       const write = a.method !== "GET";
       if (write && c && c.access !== "readwrite") return { error: "This connection is read-only. The person can allow actions in Settings → Connectors." };
@@ -128,7 +162,15 @@ export const connectorTools: ToolDef[] = [
         const [cred] = await db.select().from(credentialsTable).where(eq(credentialsTable.id, c.credentialId));
         if (cred) {
           const [k, ...v] = tpl.split(":");
-          headers[k!.trim()] = v.join(":").trim().replace("{token}", cred.surrogate);
+          const value = v.join(":").trim();
+          // A Basic template carries "username:password". The model-visible form is
+          // base64(username:surrogate); at egress substituteAuthHeader decodes it,
+          // swaps the surrogate for the real password (host-bound, as always) and
+          // re-encodes — the password itself is only ever handled server-side.
+          headers[k!.trim()] =
+            /^basic\s/i.test(value) && value.includes("{token}")
+              ? "Basic " + Buffer.from(`${cred.username ?? ""}:${cred.surrogate}`, "utf8").toString("base64")
+              : value.replace("{token}", cred.surrogate);
         }
       }
       const rawBody = a.body ? JSON.stringify(a.body) : undefined;
@@ -156,8 +198,15 @@ export const connectorTools: ToolDef[] = [
         headers[name] = substituted.text;
         sensitive ||= substituted.used.length > 0;
       }
-      if (sensitive && new URL(url).protocol !== "https:") return { error: "Requests carrying credentials must use HTTPS." };
-      const res = await publicFetch(url, { method: a.method, headers, body: rawBody, signal: AbortSignal.timeout(20000) }, { sensitive });
+      // Private-host custom connectors are exempt from the HTTPS rule: the owner configured
+      // the destination (e.g. Windmill over HTTP on the tailnet), and the vault still only
+      // swaps the credential in for its own bound host. Every other credential-carrying
+      // request — including custom connectors on public hosts — keeps the HTTPS requirement
+      // and the pinned publicFetch path.
+      if (sensitive && !relaxed && new URL(url).protocol !== "https:") return { error: "Requests carrying credentials must use HTTPS." };
+      const res = relaxed
+        ? await connectorFetch(url, { method: a.method, headers, body: rawBody, signal: AbortSignal.timeout(20000) })
+        : await publicFetch(url, { method: a.method, headers, body: rawBody, signal: AbortSignal.timeout(20000) }, { sensitive });
       markUntrustedRead(ctx.runId);
       const text = await redactSecrets(ctx.userId, (await res.text()).slice(0, 15000));
       await ctx.activity("connector", `${a.method} ${c?.displayName ?? host}${String(a.path).slice(0, 40)} → ${res.status}`, {}, "Connectors");

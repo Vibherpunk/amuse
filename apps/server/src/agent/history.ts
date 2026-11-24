@@ -42,7 +42,17 @@ export async function compactHistory(messages: HistoryMessage[], attempted: Set<
   const split = compactionSplit(trimmed);
   const older = trimmed.slice(1, split);
   if (!older.length) return result;
-  const summary = await summarize(older);
+  let summary = "";
+  try {
+    summary = await summarize(older);
+  } catch {
+    // A failed summary must never kill the run: fall back to the trimmed
+    // history with the older slice dropped (system + recent window only).
+    const fallback: HistoryMessage[] = [trimmed[0], ...trimmed.slice(split)];
+    if (approximateTokens(fallback) >= approximateTokens(trimmed)) return result;
+    attempted.add(historyKey(fallback));
+    return { messages: fallback, changed: true, summarized: false };
+  }
   if (!summary.trim()) return result;
   const candidate: HistoryMessage[] = [
     trimmed[0],
@@ -81,7 +91,7 @@ export function hasUntrustedHistory(rows: { parts: unknown[] }[]) {
     }
     return historyToolNames(replayed).some(
       (name) =>
-        /^(web_search$|web_fetch$|browser|email_|calendar_|connector|api_request$)/.test(name) ||
+        /^(web_search$|web_fetch$|web$|browser|email_|calendar_|connector|api_request$|google$|windmill$|mcp$)/.test(name) ||
         ["goto", "click", "type", "select", "scroll", "back"].includes(name),
     );
   });

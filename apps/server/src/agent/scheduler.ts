@@ -1,9 +1,9 @@
-import { and, eq, lte } from "drizzle-orm";
-import { agentsTable, db, goalsTable, messagesTable, notificationsTable, runsTable, scheduledTasksTable, spacesTable } from "@amuse/db";
-import { desc } from "drizzle-orm";
+import { and, desc, eq, lte } from "drizzle-orm";
+import { agentsTable, db, goalsTable, messagesTable, notificationsTable, runsTable, scheduledTasksTable, settingsTable, spacesTable, usersTable } from "@amuse/db";
 import { logger } from "../lib/logger";
 import { publish } from "./bus";
 import { activeRunFor, getBackgroundChatId, startRun } from "./loop";
+import { checkChatReviewDue, ensureProactiveSetup, isChatQuiet, pollExternalEvents, runNightlyConsolidation, runProactiveDreaming } from "./proactive";
 import { getMainChatId, readFile as readWorkspaceFile } from "./workspace";
 import { tipMessage, TIPS } from "./tips";
 import { nextSchedule, reminderText, scheduledRunState, tipEligible } from "./robustness";
@@ -139,6 +139,50 @@ export async function tick() {
         }
         prompt = `${t.prompt}\n\nYour HEARTBEAT.md checklist:\n${checklist.slice(0, 4000)}\n\nIf nothing needs attention, do not notify.`;
       }
+      if (t.kind === "proactive_poll") {
+        const mainId = await getMainChatId(t.userId);
+        if (!(await isChatQuiet(t.userId, !!activeRunFor(mainId)))) {
+          await db.update(scheduledTasksTable).set({ nextRunAt: new Date(Date.now() + 180_000), enabled: true }).where(eq(scheduledTasksTable.id, t.id));
+          continue;
+        }
+        const [settings] = await db.select().from(settingsTable).where(eq(settingsTable.userId, t.userId));
+        const tz = settings?.timezone ?? "America/Los_Angeles";
+        const polled = await pollExternalEvents(t.userId, tz);
+        const review = await checkChatReviewDue(t.userId);
+        if (!polled.unseen.length && !review.due) {
+          await advance(polled.skipped ? `Idle (${polled.skipped})` : "No new events");
+          continue;
+        }
+        const blocks: string[] = [t.prompt];
+        if (polled.unseen.length) {
+          blocks.push("New unseen external events:\n" + polled.unseen.map((e) => `- [${e.source}] ${e.summary}`).join("\n"));
+        }
+        if (review.due && review.windowText) {
+          blocks.push("Recent 20-message main chat window:\n<conversation>\n" + review.windowText + "\n</conversation>");
+        }
+        blocks.push("Read PROACTIVE_PREFERENCES.md and relevant skills/proactive/*.md playbooks. Update tracking items silently; call notify ONLY if the person should know now.");
+        prompt = blocks.join("\n\n");
+      }
+      if (t.kind === "proactive_dream") {
+        const mainId = await getMainChatId(t.userId);
+        if (!(await isChatQuiet(t.userId, !!activeRunFor(mainId)))) {
+          await db.update(scheduledTasksTable).set({ nextRunAt: new Date(Date.now() + 300_000), enabled: true }).where(eq(scheduledTasksTable.id, t.id));
+          continue;
+        }
+        const [settings] = await db.select().from(settingsTable).where(eq(settingsTable.userId, t.userId));
+        const tz = settings?.timezone ?? "America/Los_Angeles";
+        const dRes = await runProactiveDreaming(t.userId, tz);
+        const cRes = await runNightlyConsolidation(t.userId, tz);
+        await advance(`Dreamed ${dRes.dreamed} (+${dRes.promoted} rules); report=${cRes.wroteReport}`);
+        continue;
+      }
+      if (t.kind === "prep") {
+        const mainId = await getMainChatId(t.userId);
+        if (!(await isChatQuiet(t.userId, !!activeRunFor(mainId)))) {
+          await db.update(scheduledTasksTable).set({ nextRunAt: new Date(Date.now() + 180_000), enabled: true }).where(eq(scheduledTasksTable.id, t.id));
+          continue;
+        }
+      }
       if (t.kind === "space_refresh" && t.spaceId) {
         const [s] = await db.select().from(spacesTable).where(eq(spacesTable.id, t.spaceId));
         if (!s) {
@@ -167,5 +211,13 @@ export async function tick() {
 export function startScheduler() {
   if (timer) return;
   timer = setInterval(() => void tick(), 30000);
-  setTimeout(() => void tick(), 5000);
+  setTimeout(async () => {
+    try {
+      const users = await db.select({ id: usersTable.id }).from(usersTable);
+      for (const u of users) await ensureProactiveSetup(u.id);
+    } catch (err) {
+      logger.warn({ err }, "ensureProactiveSetup on startup failed");
+    }
+    void tick();
+  }, 5000);
 }

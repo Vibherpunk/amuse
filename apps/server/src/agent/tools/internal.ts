@@ -1,6 +1,7 @@
-import { and, eq, sql } from "drizzle-orm";
-import { agentsTable, artifactsTable, db, goalsTable, ideasTable, scheduledTasksTable, spacesTable, type PlanStep } from "@amuse/db";
+import { and, desc, eq, sql } from "drizzle-orm";
+import { agentsTable, artifactsTable, db, documentsTable, goalsTable, ideasTable, scheduledTasksTable, spacesTable, trackingItemsTable, type DocBlock, type DocComment, type PlanStep } from "@amuse/db";
 import { publish } from "../bus";
+import { makeBlockId, markdownToBlocks, slugifyDoc, syncDocToWorkspace } from "../docs";
 import { check, hasUntrustedRead } from "../sentinel";
 import { appendFile, deleteFile, listFiles, readFile, today, writeFile } from "../workspace";
 import { obj, str, num, type ToolDef } from "./types";
@@ -598,6 +599,363 @@ export const spaceTools: ToolDef[] = [
         .from(spacesTable)
         .where(and(eq(spacesTable.id, space_id), eq(spacesTable.userId, ctx.userId)));
       return s ? { id: s.id, title: s.title, data: s.data, html: s.html.slice(0, 30000) } : { error: "No such space" };
+    },
+  },
+];
+
+export const trackingTools: ToolDef[] = [
+  {
+    name: "tracking_list",
+    skill: "Tracking",
+    status: "Checking tracked items",
+    subagentSafe: true,
+    description: "List open (or closed) tracking items (todos, open questions, meetings/trips) and their attached scheduled routines.",
+    parameters: obj({ include_closed: { type: "boolean", description: "Include done/cancelled items" } }),
+    async run(a, ctx) {
+      const rows = await db
+        .select()
+        .from(trackingItemsTable)
+        .where(a.include_closed ? eq(trackingItemsTable.userId, ctx.userId) : and(eq(trackingItemsTable.userId, ctx.userId), eq(trackingItemsTable.status, "open")))
+        .orderBy(desc(trackingItemsTable.id))
+        .limit(50);
+      const tasks = await db
+        .select({ id: scheduledTasksTable.id, trackingItemId: scheduledTasksTable.trackingItemId, kind: scheduledTasksTable.kind, title: scheduledTasksTable.title, nextRunAt: scheduledTasksTable.nextRunAt, enabled: scheduledTasksTable.enabled })
+        .from(scheduledTasksTable)
+        .where(eq(scheduledTasksTable.userId, ctx.userId));
+      return {
+        items: rows.map((r) => ({
+          ...r,
+          routines: tasks.filter((t) => t.trackingItemId === r.id),
+        })),
+      };
+    },
+  },
+  {
+    name: "tracking_upsert",
+    skill: "Tracking",
+    status: "Updating tracked item",
+    description: "Create or update a tracking item (todo, question, meeting). Updates existing item when item_id or idempotency_key matches; auto-schedules a prep check for meetings >2h ahead.",
+    parameters: obj(
+      {
+        item_id: num("Existing tracking item id to update"),
+        kind: { type: "string", enum: ["todo", "question", "meeting"], description: "Item kind" },
+        content: str("Concise description (max 200 chars, no relative words like tomorrow)"),
+        due_at: str("Optional ISO 8601 timestamp"),
+        due_text: str("Optional vague due text (e.g. next week)"),
+        source_ref: str("Optional source reference (message/email/event id)"),
+        idempotency_key: str("Optional stable key to deduplicate"),
+        auto_prep: { type: "boolean", description: "Auto-schedule prep task for meetings (default true)" },
+      },
+      ["content"],
+    ),
+    async run(a, ctx) {
+      const content = String(a.content).trim().slice(0, 200);
+      const kind = ["todo", "question", "meeting"].includes(String(a.kind)) ? String(a.kind) : "todo";
+      const dueAt = a.due_at ? new Date(String(a.due_at)) : null;
+      const validDue = dueAt && !Number.isNaN(dueAt.getTime()) ? dueAt : null;
+
+      let existing = null as typeof trackingItemsTable.$inferSelect | null;
+      if (a.item_id) {
+        const [r] = await db.select().from(trackingItemsTable).where(and(eq(trackingItemsTable.id, Number(a.item_id)), eq(trackingItemsTable.userId, ctx.userId)));
+        existing = r ?? null;
+      } else if (a.idempotency_key) {
+        const [r] = await db
+          .select()
+          .from(trackingItemsTable)
+          .where(and(eq(trackingItemsTable.userId, ctx.userId), eq(trackingItemsTable.idempotencyKey, String(a.idempotency_key))));
+        existing = r ?? null;
+      }
+
+      let row: typeof trackingItemsTable.$inferSelect;
+      if (existing) {
+        const [u] = await db
+          .update(trackingItemsTable)
+          .set({
+            kind,
+            content,
+            dueAt: validDue ?? existing.dueAt,
+            dueText: a.due_text !== undefined ? String(a.due_text) : existing.dueText,
+            sourceRef: a.source_ref !== undefined ? String(a.source_ref) : existing.sourceRef,
+            revision: existing.revision + 1,
+            updatedAt: new Date(),
+          })
+          .where(eq(trackingItemsTable.id, existing.id))
+          .returning();
+        row = u!;
+      } else {
+        const [c] = await db
+          .insert(trackingItemsTable)
+          .values({
+            userId: ctx.userId,
+            kind,
+            content,
+            dueAt: validDue,
+            dueText: a.due_text ? String(a.due_text) : null,
+            sourceRef: a.source_ref ? String(a.source_ref) : null,
+            idempotencyKey: a.idempotency_key ? String(a.idempotency_key) : null,
+          })
+          .returning();
+        row = c!;
+        if (kind === "meeting" && validDue && a.auto_prep !== false && validDue.getTime() - Date.now() > 2 * 3600_000) {
+          const leadMs = validDue.getTime() - Date.now() > 20 * 3600_000 ? 18 * 3600_000 : 2 * 3600_000;
+          await db.insert(scheduledTasksTable).values({
+            userId: ctx.userId,
+            kind: "prep",
+            trackingItemId: row.id,
+            title: `Prep: ${content.slice(0, 60)}`,
+            prompt: `Look up first: ${content}. Check google (mail/calendar), memory_search, and web if helpful, create a concise prep artifact (create -> artifact_create), and notify the user with key points and the artifact.`,
+            nextRunAt: new Date(validDue.getTime() - leadMs),
+            enabled: true,
+          });
+        }
+      }
+      await ctx.activity("skill", `${existing ? "Updated" : "Tracked"} ${kind}: ${content}`, { id: row.id }, "Tracking");
+      return { item: row };
+    },
+  },
+  {
+    name: "tracking_done",
+    skill: "Tracking",
+    status: "Closing tracked item",
+    description: "Mark a tracking item done or cancelled and disable its linked scheduled routines.",
+    parameters: obj({ item_id: num("Tracking item id"), status: { type: "string", enum: ["done", "cancelled"] } }, ["item_id"]),
+    async run(a, ctx) {
+      const status = a.status === "cancelled" ? "cancelled" : "done";
+      const [existing] = await db
+        .select()
+        .from(trackingItemsTable)
+        .where(and(eq(trackingItemsTable.id, Number(a.item_id)), eq(trackingItemsTable.userId, ctx.userId)));
+      if (!existing) return { error: "No such tracking item" };
+      const [updated] = await db
+        .update(trackingItemsTable)
+        .set({ status, revision: existing.revision + 1, updatedAt: new Date() })
+        .where(eq(trackingItemsTable.id, existing.id))
+        .returning();
+      await db
+        .update(scheduledTasksTable)
+        .set({ enabled: false, lastResult: `Tracking item ${status}` })
+        .where(and(eq(scheduledTasksTable.userId, ctx.userId), eq(scheduledTasksTable.trackingItemId, existing.id)));
+      await ctx.activity("skill", `Marked tracking item #${existing.id} ${status}`, {}, "Tracking");
+      return { item: updated };
+    },
+  },
+];
+
+const VALID_BLOCK_TYPES = new Set(["p", "h1", "h2", "h3", "bullet", "todo", "callout", "quote", "code", "divider"]);
+
+function parseBlocksInput(markdown?: unknown, blocksRaw?: unknown): DocBlock[] {
+  if (Array.isArray(blocksRaw)) {
+    return blocksRaw
+      .filter((b): b is Record<string, unknown> => !!b && typeof b === "object")
+      .map((b) => {
+        const type = VALID_BLOCK_TYPES.has(String(b.type)) ? (String(b.type) as DocBlock["type"]) : "p";
+        return {
+          id: String(b.id || makeBlockId()),
+          type,
+          text: String(b.text ?? ""),
+          ...(type === "todo" ? { checked: Boolean(b.checked) } : {}),
+        };
+      });
+  }
+  if (typeof markdown === "string" && markdown.trim()) {
+    return markdownToBlocks(markdown);
+  }
+  return [{ id: makeBlockId(), type: "p", text: "" }];
+}
+
+export const docTools: ToolDef[] = [
+  {
+    name: "doc_list",
+    skill: "Docs",
+    status: "Listing docs",
+    description: "List collaborative Notion-style documents.",
+    parameters: obj({}),
+    async run(_a, ctx) {
+      const rows = await db
+        .select()
+        .from(documentsTable)
+        .where(eq(documentsTable.userId, ctx.userId))
+        .orderBy(desc(documentsTable.updatedAt))
+        .limit(50);
+      return {
+        docs: rows.map((d) => ({
+          id: d.id,
+          title: d.title,
+          emoji: d.emoji,
+          updated_at: d.updatedAt,
+          block_count: Array.isArray(d.blocks) ? d.blocks.length : 0,
+        })),
+      };
+    },
+  },
+  {
+    name: "doc_get",
+    skill: "Docs",
+    status: "Reading doc",
+    description: "Read a collaborative document and its blocks (with block ids and comments).",
+    parameters: obj({ doc_id: num("Document id") }, ["doc_id"]),
+    async run({ doc_id }, ctx) {
+      const [doc] = await db
+        .select()
+        .from(documentsTable)
+        .where(and(eq(documentsTable.id, Number(doc_id)), eq(documentsTable.userId, ctx.userId)));
+      if (!doc) return { error: "Document not found" };
+      return { doc };
+    },
+  },
+  {
+    name: "doc_create",
+    skill: "Docs",
+    status: "Creating doc",
+    description: "Create a collaborative Notion-style document from markdown or blocks.",
+    parameters: obj(
+      {
+        title: str("Document title"),
+        emoji: str("Optional single emoji"),
+        markdown: str("Optional markdown body to parse into blocks"),
+        blocks: { type: "array", items: { type: "object" }, description: "Optional array of block objects" },
+      },
+      ["title"],
+    ),
+    async run(a, ctx) {
+      const title = String(a.title).trim().slice(0, 160) || "Untitled";
+      const emoji = String(a.emoji ?? "📝").trim().slice(0, 16) || "📝";
+      const blocks = parseBlocksInput(a.markdown, a.blocks);
+      const slug = slugifyDoc(title);
+      const [doc] = await db
+        .insert(documentsTable)
+        .values({ userId: ctx.userId, title, emoji, slug, blocks })
+        .returning();
+      await syncDocToWorkspace(ctx.userId, doc!);
+      publish(ctx.userId, { type: "refresh", what: "docs" });
+      await ctx.activity("skill", `Created doc: ${title}`, { docId: doc!.id }, "Docs");
+      return { doc_id: doc!.id, title: doc!.title, url: `/docs/${doc!.id}`, block_count: blocks.length };
+    },
+  },
+  {
+    name: "doc_update_block",
+    skill: "Docs",
+    status: "Updating doc block",
+    description: "Update a single block in place inside a collaborative document without touching other blocks.",
+    parameters: obj(
+      {
+        doc_id: num("Document id"),
+        block_id: str("Target block id"),
+        content: str("New text for the block"),
+        block_type: { type: "string", enum: ["p", "h1", "h2", "h3", "bullet", "todo", "callout", "quote", "code", "divider"] },
+        checked: { type: "boolean", description: "Checked state for todo blocks" },
+      },
+      ["doc_id", "block_id"],
+    ),
+    async run(a, ctx) {
+      const [existing] = await db
+        .select()
+        .from(documentsTable)
+        .where(and(eq(documentsTable.id, Number(a.doc_id)), eq(documentsTable.userId, ctx.userId)));
+      if (!existing) return { error: "Document not found" };
+      const blocks = [...(Array.isArray(existing.blocks) ? existing.blocks : [])];
+      const idx = blocks.findIndex((b) => b.id === String(a.block_id));
+      if (idx === -1) return { error: `Block ${a.block_id} not found` };
+      const cur = blocks[idx]!;
+      const nextType = a.block_type && VALID_BLOCK_TYPES.has(String(a.block_type)) ? (String(a.block_type) as DocBlock["type"]) : cur.type;
+      blocks[idx] = {
+        ...cur,
+        type: nextType,
+        ...(a.content !== undefined ? { text: String(a.content) } : {}),
+        ...(nextType === "todo" ? { checked: a.checked !== undefined ? Boolean(a.checked) : Boolean(cur.checked) } : {}),
+      };
+      const [doc] = await db
+        .update(documentsTable)
+        .set({ blocks, updatedAt: new Date() })
+        .where(and(eq(documentsTable.id, existing.id), eq(documentsTable.userId, ctx.userId)))
+        .returning();
+      await syncDocToWorkspace(ctx.userId, doc!);
+      publish(ctx.userId, { type: "refresh", what: "docs" });
+      await ctx.activity("skill", `Updated block ${cur.id} in "${existing.title}"`, { docId: existing.id }, "Docs");
+      return { ok: true, doc_id: existing.id, block: blocks[idx] };
+    },
+  },
+  {
+    name: "doc_append_blocks",
+    skill: "Docs",
+    status: "Appending to doc",
+    description: "Append blocks (from markdown or blocks array) to a collaborative document, optionally after a specific block_id.",
+    parameters: obj(
+      {
+        doc_id: num("Document id"),
+        markdown: str("Markdown to append as blocks"),
+        blocks: { type: "array", items: { type: "object" }, description: "Blocks to append" },
+        after_block_id: str("Optional block id to insert after"),
+      },
+      ["doc_id"],
+    ),
+    async run(a, ctx) {
+      const [existing] = await db
+        .select()
+        .from(documentsTable)
+        .where(and(eq(documentsTable.id, Number(a.doc_id)), eq(documentsTable.userId, ctx.userId)));
+      if (!existing) return { error: "Document not found" };
+      const added = parseBlocksInput(a.markdown, a.blocks);
+      const blocks = [...(Array.isArray(existing.blocks) ? existing.blocks : [])];
+      if (a.after_block_id) {
+        const idx = blocks.findIndex((b) => b.id === String(a.after_block_id));
+        if (idx !== -1) blocks.splice(idx + 1, 0, ...added);
+        else blocks.push(...added);
+      } else {
+        blocks.push(...added);
+      }
+      const [doc] = await db
+        .update(documentsTable)
+        .set({ blocks, updatedAt: new Date() })
+        .where(and(eq(documentsTable.id, existing.id), eq(documentsTable.userId, ctx.userId)))
+        .returning();
+      await syncDocToWorkspace(ctx.userId, doc!);
+      publish(ctx.userId, { type: "refresh", what: "docs" });
+      await ctx.activity("skill", `Appended ${added.length} block(s) to "${existing.title}"`, { docId: existing.id }, "Docs");
+      return { ok: true, doc_id: existing.id, added_count: added.length };
+    },
+  },
+  {
+    name: "doc_comment_reply",
+    skill: "Docs",
+    status: "Replying on doc",
+    description: "Reply to a comment thread on a document block (and optionally mark the thread resolved).",
+    parameters: obj(
+      {
+        doc_id: num("Document id"),
+        block_id: str("Target block id"),
+        content: str("Reply message"),
+        resolve: { type: "boolean", description: "Mark comments on this block resolved" },
+      },
+      ["doc_id", "block_id", "content"],
+    ),
+    async run(a, ctx) {
+      const [existing] = await db
+        .select()
+        .from(documentsTable)
+        .where(and(eq(documentsTable.id, Number(a.doc_id)), eq(documentsTable.userId, ctx.userId)));
+      if (!existing) return { error: "Document not found" };
+      const blocks = [...(Array.isArray(existing.blocks) ? existing.blocks : [])];
+      const idx = blocks.findIndex((b) => b.id === String(a.block_id));
+      if (idx === -1) return { error: `Block ${a.block_id} not found` };
+      const cur = blocks[idx]!;
+      const comment: DocComment = {
+        id: `c_${Math.random().toString(36).slice(2, 8)}`,
+        author: "agent",
+        text: String(a.content),
+        createdAt: new Date().toISOString(),
+        ...(a.resolve ? { resolved: true } : {}),
+      };
+      const prevComments = (cur.comments ?? []).map((c) => (a.resolve ? { ...c, resolved: true } : c));
+      blocks[idx] = { ...cur, comments: [...prevComments, comment] };
+      const [doc] = await db
+        .update(documentsTable)
+        .set({ blocks, updatedAt: new Date() })
+        .where(and(eq(documentsTable.id, existing.id), eq(documentsTable.userId, ctx.userId)))
+        .returning();
+      await syncDocToWorkspace(ctx.userId, doc!);
+      publish(ctx.userId, { type: "refresh", what: "docs" });
+      return { ok: true, doc_id: existing.id, comment };
     },
   },
 ];

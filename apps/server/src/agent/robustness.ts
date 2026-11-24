@@ -131,6 +131,11 @@ export function hasActionEvidence(
   return (
     approvals.some((a) => a.status === "allowed" && actions.includes(a.actionClass)) ||
     activity.some((a) => actions.includes(a.kind) || actions.includes(String(a.details.actionClass ?? ""))) ||
-    toolNames.some((name) => /(?:send|submit|purchase|checkout|pay)/i.test(name) || name.startsWith("browser") || name === "api_request")
+    toolNames.some(
+      (name) =>
+        /(?:send|submit|purchase|checkout|pay)/i.test(name) ||
+        name.startsWith("browser") ||
+        ["api_request", "connectors", "google", "windmill", "mcp"].includes(name),
+    )
   );
 }

@@ -20,7 +20,7 @@ services:
       DATABASE_URL: postgres://amuse:amuse@db:5432/amuse
     # Published on localhost only: Amuse has no login, so don't expose it to your network.
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:3001:3000"
     volumes:
       - amuse-data:/data
     depends_on:

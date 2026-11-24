@@ -404,12 +404,14 @@ function CredentialCard({ p, chatId }: { p: any; chatId: number }) {
           {error}
         </p>
       )}
-      {p.host && !p.baseUrl && <Input placeholder="Username (optional)" value={username} onChange={(e) => setUsername(e.target.value)} className="mb-2" />}
-      <Input type="password" placeholder="Paste it here" value={secret} onChange={(e) => setSecret(e.target.value)} />
+      {(p.auth === "basic" || (p.host && !p.baseUrl)) && (
+        <Input placeholder={p.auth === "basic" ? "Username" : "Username (optional)"} value={username} onChange={(e) => setUsername(e.target.value)} className="mb-2" />
+      )}
+      <Input type="password" placeholder={p.auth === "basic" ? "Password" : "Paste it here"} value={secret} onChange={(e) => setSecret(e.target.value)} />
       <div className="mt-3 flex items-center gap-2">
         <Button
           size="sm"
-          disabled={!secret || !destination || !confirmed || busy}
+          disabled={!secret || !destination || !confirmed || busy || (p.auth === "basic" && !username.trim())}
           onClick={async () => {
             setBusy(true);
             try {
@@ -421,6 +423,7 @@ function CredentialCard({ p, chatId }: { p: any; chatId: number }) {
                 secret,
                 baseUrl: p.baseUrl,
                 header: p.header,
+                auth: p.auth ?? null,
                 chatId,
               });
               setDone(true);

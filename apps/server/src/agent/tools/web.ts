@@ -1,4 +1,5 @@
 import { MODELS, openai } from "../../lib/ai";
+import { openaiBaseUrl } from "../../lib/config";
 import { check, hostOf, isPublicUrl, publicFetch, markUntrustedRead, recordTrustedUrls } from "../sentinel";
 import { obj, str, type ToolDef } from "./types";
 
@@ -61,11 +62,63 @@ async function openaiSearch(query: string, max: number) {
   };
 }
 
+/** Keyless fallback search: parse Bing's HTML results page. Used when the model provider has no hosted search tool (e.g. a local model server). */
+async function bingSearch(query: string, max: number) {
+  const res = await publicFetch(`https://www.bing.com/search?q=${encodeURIComponent(query)}&count=${Math.max(max, 10)}`, {
+    headers: { "user-agent": UA, accept: "text/html" },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!res.ok) throw new Error(`Bing search returned HTTP ${res.status}`);
+  const html = await res.text();
+  const results: { title: string; url: string; snippet: string }[] = [];
+  for (const block of html.split(/<li class="b_algo"/).slice(1)) {
+    const m = block.match(/<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/);
+    if (!m) continue;
+    let url = decodeEntities(m[1]);
+    // Bing wraps result links in a /ck/a redirector; the real URL is base64url in the u parameter.
+    const u = url.match(/[?&]u=a1([^&]+)/);
+    if (u) {
+      try {
+        const b64 = u[1].replace(/-/g, "+").replace(/_/g, "/");
+        url = Buffer.from(b64 + "=".repeat((4 - (b64.length % 4)) % 4), "base64").toString("utf8");
+      } catch {
+        // Keep the redirector URL if decoding fails.
+      }
+    }
+    if (!/^https?:\/\//.test(url)) continue;
+    const title = decodeEntities(m[2].replace(/<[^>]+>/g, "")).trim();
+    const rawSnippet = block.match(/<p[^>]*>([\s\S]*?)<\/p>/)?.[1] ?? "";
+    const snippet = decodeEntities(rawSnippet.replace(/<[^>]+>/g, "")).trim().slice(0, 300);
+    results.push({ title: title || url, url, snippet });
+    if (results.length >= max) break;
+  }
+  return {
+    results,
+    summary: results.map((r) => `- ${r.title}: ${r.snippet} (${r.url})`).join("\n").slice(0, 3000),
+  };
+}
+
+/** True when the model provider is not OpenAI itself (e.g. LM Studio), so its hosted web_search tool does not exist. */
+const localProvider = !!openaiBaseUrl && !openaiBaseUrl.includes("api.openai.com");
+
 export async function webSearchAll(
   query: string,
   max = 8,
 ): Promise<{ results: { title: string; url: string; snippet: string }[]; summary?: string; usage?: any }> {
-  return openaiSearch(query, max);
+  if (localProvider) {
+    try {
+      const r = await bingSearch(query, max);
+      if (r.results.length) return r;
+    } catch {
+      // Fall through to the provider search below.
+    }
+    return openaiSearch(query, max);
+  }
+  try {
+    return await openaiSearch(query, max);
+  } catch {
+    return bingSearch(query, max);
+  }
 }
 
 export async function fetchPage(url: string, maxChars = 14000) {
@@ -104,7 +157,7 @@ export const webTools: ToolDef[] = [
       try {
         found = await webSearchAll(String(query));
       } catch (e) {
-        return { error: `OpenAI web search failed: ${(e as Error).message}. No alternative search provider was contacted.` };
+        return { error: `Web search failed: ${(e as Error).message}` };
       }
       if (found.usage) await ctx.usage({ tokensIn: (found.usage.input_tokens ?? 0) + 10000, tokensOut: found.usage.output_tokens ?? 0 });
       const results = found.results;

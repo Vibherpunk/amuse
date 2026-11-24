@@ -344,7 +344,7 @@ await step("F24", "Secure credentials store (secret never shown)", async () => {
   await api("/credentials", "POST", {
     label: "Demo API key",
     host: "httpbin.org",
-    secret: "sk-demo-SECRET-123456",
+    secret: "test-secret-not-real",
     baseUrl: "https://httpbin.org",
     header: "X-Api-Key: {token}",
     confirmedHost: "httpbin.org",

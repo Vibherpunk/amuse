@@ -5,6 +5,34 @@ over, runs reminders and background checks, tracks goals and builds small apps y
 asks before it sends, submits or pays for anything. Amuse runs on your own computer for one person.
 It needs an OpenAI API key and PostgreSQL. No account, hosted service or other API key is required.
 
+## How this fork differs from upstream
+
+This repo is a public snapshot of a privately run, customized build of Amuse. The main differences from replit/amuse:
+
+- **Proactive engine** - scheduled background checks and a heartbeat that track topics over time and only surface what matters.
+- **Collaborative documents** - documents that live inside the app and are edited by the owner and the agent together: the agent drafts and revises in place, alongside the owner's own edits, instead of handing files back and forth.
+- **MCP gateways with per-server tool allowlists** - MCP tool servers connect through a gateway layer, and each server exposes only an approved subset of its tools, enforced in code rather than by prompting. In the running build, an automation server that ships 68 tools is cut to 4 operator verbs (list, run a flow, run a script, read a result - builder operations excluded), and a device-management server that ships 47 tools is cut to 10 (seven reads plus start/stop/restart, approval-gated). A small proof MCP server is included for testing new integrations before they are trusted.
+- **Multi-account Google gateways** - Gmail and Calendar access routed per account through an external connection broker, so the agent can work across several mailboxes without holding their credentials.
+- **Host terminal executor** - shell commands run on the host through a separate executor service, with per-command approval prompts.
+- **Lean local voice** - speech synthesis and transcription run on local services instead of cloud voice APIs.
+- **Provider and model changes for local inference** - upstream assumes a single hosted API. This fork generalizes the provider layer: local OpenAI-compatible servers (oMLX, LM Studio) are first-class providers alongside cloud ones, over both the Responses API and Chat Completions, and model calls can route through a local redacting egress gate on the way out. Requests to the gate use a plain HTTP client because the gate rejects browser-style request headers.
+- **Compaction fallback** - when summarizing an over-long chat history fails, the run falls back to trimming the history instead of failing.
+
+### Models this build has been run and tested on
+
+- Qwen3.6-35B-A3B at 3-bit (MoE, roughly 3B active parameters per token), served locally by oMLX
+- Gemma 4 MoE, served locally
+- Qwen3.8-27B, served locally by oMLX
+- Muse Spark 1.3 (contributor), via OpenCode Go through the egress gate
+
+### Why the small-active-parameter route works here
+
+- **Tool calling holds up:** in an 18-case tool-caller benchmark, the local Gemma MoE scored 18/18, ahead of Qwen3-4B (15/18) and Qwen3-8B (11/18) - the agent picks and calls the right tools, including the live browser: web research, form-filling, and shopping all run through it.
+- **Low token usage per turn:** memory is retrieved on demand instead of being carried in every prompt, so a full day of half-hourly heartbeat checks plus active chats on the paid Spark route cost a few cents in total.
+- **Cheap to keep loaded:** a 35B MoE with ~3B active parameters does the work at a fraction of the memory and compute of the large dense models most open-source personal agents load, while still driving tools, browsing, and background work reliably.
+
+The snapshot is code only: configuration, credentials, and personal data are excluded.
+
 ## Features
 
 - Chat with an agent you name and shape, with side chats for separate topics

@@ -1,8 +1,38 @@
 import PDFDocument from "pdfkit";
 import { artifactsTable, db } from "@amuse/db";
-import { MODELS, openai, speechSeconds, synthesizeSpeech, textCompletion } from "../../lib/ai";
+import { MODELS, imageOpenai, speechSeconds, synthesizeSpeech, textCompletion } from "../../lib/ai";
 
 import { obj, str, num, type ToolDef } from "./types";
+
+/** Join PCM WAV segments (same format) into one WAV: a single header over the concatenated data chunks. */
+function joinWavSegments(buffers: Buffer[]): Buffer {
+  const isWav = (b: Buffer) => b.length > 44 && b.toString("ascii", 0, 4) === "RIFF" && b.toString("ascii", 8, 12) === "WAVE";
+  if (!buffers.length || !buffers.every(isWav)) return Buffer.concat(buffers);
+  const chunkData = (b: Buffer, want: string): Buffer | null => {
+    let off = 12;
+    while (off + 8 <= b.length) {
+      const id = b.toString("ascii", off, off + 4);
+      const size = b.readUInt32LE(off + 4);
+      if (id === want) return b.subarray(off + 8, off + 8 + size);
+      off += 8 + size + (size % 2);
+    }
+    return null;
+  };
+  const fmt = chunkData(buffers[0], "fmt ");
+  const parts = buffers.map((b) => chunkData(b, "data")).filter((d): d is Buffer => d !== null);
+  if (!fmt || !parts.length) return Buffer.concat(buffers);
+  const data = Buffer.concat(parts);
+  const header = Buffer.alloc(28 + fmt.length);
+  header.write("RIFF", 0, "ascii");
+  header.writeUInt32LE(header.length - 8 + data.length, 4);
+  header.write("WAVE", 8, "ascii");
+  header.write("fmt ", 12, "ascii");
+  header.writeUInt32LE(fmt.length, 16);
+  fmt.copy(header, 20);
+  header.write("data", 20 + fmt.length, "ascii");
+  header.writeUInt32LE(data.length, 24 + fmt.length);
+  return Buffer.concat([header, data]);
+}
 
 function markdownToPdf(title: string, md: string): Promise<Buffer> {
   return new Promise((resolve) => {
@@ -50,7 +80,7 @@ export const mediaTools: ToolDef[] = [
     async run({ prompt, shape }, ctx) {
       await ctx.setStatus("Making an image");
       const size = shape === "portrait" ? "1024x1536" : shape === "landscape" ? "1536x1024" : "1024x1024";
-      const res = await openai.images.generate({
+      const res = await imageOpenai.images.generate({
         model: MODELS.image,
         prompt,
         size: size as any,
@@ -116,14 +146,14 @@ export const mediaTools: ToolDef[] = [
         .map((l) => l.trim())
         .filter((l) => /^(AVA|LEO):/.test(l));
       await ctx.setStatus("Recording a podcast");
-      // Two OpenAI voices, voiced a few lines at a time; MP3 segments play back-to-back when joined.
+      // Two voices, voiced a few lines at a time; WAV segments are joined into a single file.
       const turns = lines.slice(0, 60).map((l) => ({ voice: l.startsWith("AVA") ? "coral" : "ash", text: l.replace(/^(AVA|LEO):\s*/, "") }));
       const audio: Buffer[] = new Array(turns.length);
       for (let i = 0; i < turns.length && !ctx.signal.stopped; i += 6) {
         await Promise.all(turns.slice(i, i + 6).map(async (t, j) => (audio[i + j] = await synthesizeSpeech(t.text, t.voice))));
       }
-      const mp3 = Buffer.concat(audio.filter(Boolean));
-      if (!mp3.length) return { error: "Recording was stopped before any audio was made." };
+      const wav = joinWavSegments(audio.filter(Boolean));
+      if (!wav.length) return { error: "Recording was stopped before any audio was made." };
       const seconds = turns.reduce((n, t) => n + speechSeconds(t.text), 0);
       await ctx.usage({ audioSeconds: seconds });
       const [a] = await db
@@ -133,7 +163,7 @@ export const mediaTools: ToolDef[] = [
           chatId: ctx.chatId,
           kind: "audio",
           title: `Podcast: ${topic}`,
-          content: `data:audio/mpeg;base64,${mp3.toString("base64")}`,
+          content: `data:audio/wav;base64,${wav.toString("base64")}`,
           meta: { script: lines.join("\n"), seconds },
         })
         .returning();

@@ -21,17 +21,23 @@ import {
   spacesTable,
   connectorsTable,
   credentialsTable,
+  mcpServersTable,
   grantsTable,
   runsTable,
   usageTable,
   browserSessionsTable,
+  trackingItemsTable,
+  proactiveDeliveriesTable,
+  proactiveCluesTable,
+  proactiveRuleVersionsTable,
 } from "@amuse/db";
 import { subscribe } from "../agent/bus";
 import { activeRunFor, startRun, steer, stopRun } from "../agent/loop";
+import { formatMeetingSessionMarkdown, pollExternalEvents, slugifyTitle } from "../agent/proactive";
 import { resolveApproval } from "../agent/sentinel";
 import { DAILY_LIMIT, getUsage, record } from "../agent/usage";
-import { deleteFile, ensureUserSetup, getMainChatId, listFiles, readFile, writeFile } from "../agent/workspace";
-import { jsonCompletion, MODELS, openai } from "../lib/ai";
+import { deleteFile, ensureUserSetup, getMainChatId, listFiles, readFile, today, writeFile } from "../agent/workspace";
+import { jsonCompletion, MODELS, imageOpenai, openai, transcribeOpenai } from "../lib/ai";
 import { forgetSetup, idParam, requireAuth, uid } from "./helpers";
 
 const router: IRouter = Router();
@@ -56,7 +62,7 @@ router.post("/agent/avatar-options", async (req, res) => {
   const { look = "a small round fluffy creature", style = "soft 3D clay" } = req.body ?? {};
   const prompt = `A 2x2 grid sheet of four distinct character avatar options for a friendly personal AI companion. Each cell: one cute mascot, centered, plain pastel background, no text. Look: ${String(look).slice(0, 200)}. Style: ${String(style).slice(0, 80)}. Make the four variations differ in color and expression.`;
   try {
-    const r = await openai.images.generate({ model: MODELS.image, prompt, size: "1024x1024", quality: "low", output_format: "jpeg", n: 1 } as any);
+    const r = await imageOpenai.images.generate({ model: MODELS.image, prompt, size: "1024x1024", quality: "low", output_format: "jpeg", n: 1 } as any);
     const b64 = (r.data?.[0] as any)?.b64_json;
     await record(userId, { images: 1 });
     res.json({ sheet: `data:image/jpeg;base64,${b64}` });
@@ -529,6 +535,7 @@ router.post("/settings/reset", async (req, res) => {
     spacesTable,
     connectorsTable,
     credentialsTable,
+    mcpServersTable,
     allowedSitesTable,
     notificationsTable,
     runsTable,
@@ -584,6 +591,142 @@ router.post("/messages/:id/react", async (req, res) => {
   const [u] = await db.update(messagesTable).set({ parts }).where(eq(messagesTable.id, m.id)).returning();
   publish(userId, { type: "message", chatId: m.chatId, message: u });
   res.json({ message: u });
+});
+
+// ---------- proactive, tracking items & local meeting pipeline ----------
+router.get("/proactive/status", async (req, res) => {
+  const userId = uid(req);
+  const schedules = await db
+    .select({ id: scheduledTasksTable.id, kind: scheduledTasksTable.kind, title: scheduledTasksTable.title, enabled: scheduledTasksTable.enabled, intervalMinutes: scheduledTasksTable.intervalMinutes, nextRunAt: scheduledTasksTable.nextRunAt, lastResult: scheduledTasksTable.lastResult })
+    .from(scheduledTasksTable)
+    .where(eq(scheduledTasksTable.userId, userId));
+  const trackingItems = await db.select().from(trackingItemsTable).where(and(eq(trackingItemsTable.userId, userId), eq(trackingItemsTable.status, "open")));
+  const deliveries = await db.select().from(proactiveDeliveriesTable).where(eq(proactiveDeliveriesTable.userId, userId)).orderBy(desc(proactiveDeliveriesTable.id)).limit(10);
+  const clues = await db.select().from(proactiveCluesTable).where(eq(proactiveCluesTable.userId, userId));
+  const [ruleVersion] = await db.select().from(proactiveRuleVersionsTable).where(eq(proactiveRuleVersionsTable.userId, userId)).orderBy(desc(proactiveRuleVersionsTable.version)).limit(1);
+  const playbooks = (await listFiles(userId, "skills/proactive/")).map((f) => f.path);
+  res.json({
+    schedules: schedules.filter((s) => ["heartbeat", "proactive_poll", "proactive_dream", "prep"].includes(s.kind)),
+    openTrackingItems: trackingItems.length,
+    recentDeliveries: deliveries.length,
+    cluesCount: clues.length,
+    ruleVersion: ruleVersion?.version ?? 0,
+    playbooks,
+  });
+});
+
+router.get("/tracking-items", async (req, res) => {
+  const userId = uid(req);
+  const includeClosed = req.query.include_closed === "1" || req.query.include_closed === "true";
+  const items = await db
+    .select()
+    .from(trackingItemsTable)
+    .where(includeClosed ? eq(trackingItemsTable.userId, userId) : and(eq(trackingItemsTable.userId, userId), eq(trackingItemsTable.status, "open")))
+    .orderBy(desc(trackingItemsTable.id))
+    .limit(50);
+  res.json({ items });
+});
+
+router.post("/tracking-items/:id/done", async (req, res) => {
+  const userId = uid(req);
+  const id = idParam(req);
+  const [existing] = await db.select().from(trackingItemsTable).where(and(eq(trackingItemsTable.id, id), eq(trackingItemsTable.userId, userId)));
+  if (!existing) {
+    res.status(404).json({ error: "No such tracking item" });
+    return;
+  }
+  const [item] = await db
+    .update(trackingItemsTable)
+    .set({ status: "done", revision: existing.revision + 1, updatedAt: new Date() })
+    .where(eq(trackingItemsTable.id, id))
+    .returning();
+  await db.update(scheduledTasksTable).set({ enabled: false, lastResult: "Tracking item done" }).where(and(eq(scheduledTasksTable.userId, userId), eq(scheduledTasksTable.trackingItemId, id)));
+  res.json({ ok: true, item });
+});
+
+router.post("/meetings/ingest", async (req, res) => {
+  const userId = uid(req);
+  const body = req.body ?? {};
+  let transcript = typeof body.transcript === "string" ? body.transcript.trim() : "";
+
+  if (!transcript && typeof body.audioBase64 === "string" && body.audioBase64.trim()) {
+    const buf = Buffer.from(body.audioBase64, "base64");
+    const mime = typeof body.mimeType === "string" ? body.mimeType : "audio/webm";
+    const filename = typeof body.filename === "string" ? body.filename : "meeting.webm";
+    const file = new File([buf], filename, { type: mime });
+    const tr = await transcribeOpenai.audio.transcriptions.create({ model: MODELS.transcribe, file });
+    transcript = tr.text?.trim() ?? "";
+  }
+  if (!transcript) {
+    res.status(400).json({ error: "Either transcript or audioBase64 is required." });
+    return;
+  }
+
+  const [settings] = await db.select().from(settingsTable).where(eq(settingsTable.userId, userId));
+  const tz = settings?.timezone ?? "America/Los_Angeles";
+  const date = today(tz);
+  let extracted = {
+    title: typeof body.title === "string" && body.title.trim() ? body.title.trim() : `Meeting ${date}`,
+    summary: transcript.slice(0, 240),
+    topics: [] as string[],
+    decisions: [] as string[],
+    action_items: [] as string[],
+  };
+  try {
+    const r = await jsonCompletion<typeof extracted>(
+      'Summarize this meeting transcript into JSON: {"title": string, "summary": string, "topics": string[], "decisions": string[], "action_items": string[]}. Keep action_items concise and concrete.',
+      transcript.slice(0, 8000),
+    );
+    if (r.data) extracted = { ...extracted, ...r.data, title: (typeof body.title === "string" && body.title.trim()) || r.data.title || extracted.title };
+  } catch {
+    // Fallback uses deterministic summary above
+  }
+
+  const slug = slugifyTitle(extracted.title) || `meeting-${Date.now()}`;
+  const wikiPath = `wiki/sessions/${date}-${slug}.md`;
+  const md = formatMeetingSessionMarkdown({
+    date,
+    title: extracted.title,
+    summary: extracted.summary,
+    topics: Array.isArray(extracted.topics) ? extracted.topics : [],
+    decisions: Array.isArray(extracted.decisions) ? extracted.decisions : [],
+    actionItems: Array.isArray(extracted.action_items) ? extracted.action_items : [],
+    transcript,
+  });
+  await writeFile(userId, wikiPath, md);
+
+  const createdItems = [];
+  for (const itemText of (Array.isArray(extracted.action_items) ? extracted.action_items : []).slice(0, 10)) {
+    const clean = String(itemText).trim().slice(0, 200);
+    if (!clean) continue;
+    const [row] = await db.insert(trackingItemsTable).values({ userId, kind: "todo", content: clean, sourceRef: wikiPath }).returning();
+    if (row) createdItems.push(row);
+  }
+
+  const mainId = await getMainChatId(userId);
+  const chatSummary = `**Meeting notes: ${extracted.title}**\n${extracted.summary}${createdItems.length ? `\n\nTracked ${createdItems.length} action item(s).` : ""}`;
+  const [msg] = await db.insert(messagesTable).values({ userId, chatId: mainId, role: "assistant", content: chatSummary, proactive: true }).returning();
+  publish(userId, { type: "message", chatId: mainId, message: msg });
+  publish(userId, { type: "refresh", what: "files" });
+
+  res.json({ ok: true, wikiPath, summary: extracted.summary, trackingItems: createdItems, messageId: msg?.id });
+});
+
+router.post("/proactive/poll-now", async (req, res) => {
+  const userId = uid(req);
+  const [settings] = await db.select().from(settingsTable).where(eq(settingsTable.userId, userId));
+  const tz = settings?.timezone ?? "America/Los_Angeles";
+  const result = await pollExternalEvents(userId, tz);
+  res.json({
+    ok: true,
+    skipped: result.skipped ?? null,
+    unseenCount: result.unseen.length,
+    sources: {
+      gmail: result.unseen.filter((u) => u.source === "gmail").length,
+      calendar: result.unseen.filter((u) => u.source === "calendar").length,
+    },
+    diagnostics: result.diagnostics ?? [],
+  });
 });
 
 export default router;

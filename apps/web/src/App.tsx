@@ -13,6 +13,7 @@ import { Onboarding } from "./pages/Onboarding";
 import { SettingsPage } from "./pages/Settings";
 import { SpacesPage, SpaceView } from "./pages/Spaces";
 import { FeedPage, LibraryPage, SearchPage } from "./pages/Discover";
+import { DocsPage } from "./pages/Docs";
 
 function SideChat({ me, id }: { me: Me; id: number }) {
   const { data } = useQuery({ queryKey: ["chats"], queryFn: () => api("/chats") });
@@ -75,6 +76,10 @@ export default function App() {
                 <SpacesPage />
               </Route>
               <Route path="/spaces/:id">{(p) => <SpaceView key={p.id} id={Number(p.id)} />}</Route>
+              <Route path="/docs">
+                <DocsPage />
+              </Route>
+              <Route path="/docs/:id">{(p) => <DocsPage activeId={Number(p.id)} />}</Route>
               <Route path="/settings">
                 <SettingsPage me={me} />
               </Route>

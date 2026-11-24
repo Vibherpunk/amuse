@@ -1,0 +1,30 @@
+services:
+  speaches:
+    image: ghcr.io/speaches-ai/speaches:latest-cpu
+    environment:
+      HF_HOME: /data
+      PRELOAD_MODELS: '["Systran/faster-whisper-base", "speaches-ai/Kokoro-82M-v1.0-ONNX"]'
+      WHISPER__TTL: "-1"
+    volumes:
+      - /Users/ai/speaches-data:/data
+    ports:
+      - "127.0.0.1:8001:8000"
+
+  amuse:
+    environment:
+      AMUSE_SPEECH_BASE_URL: http://speaches:8000/v1
+      AMUSE_VOICE_LANE: current
+      AMUSE_KYUTAI_BASE_URL: http://host.docker.internal:8084/v1
+      AMUSE_TRANSCRIBE_BASE_URL: http://speaches:8000/v1
+      AMUSE_IMAGE_BASE_URL: http://host.docker.internal:8123/v1
+      AMUSE_TRANSCRIBE_MODEL: Systran/faster-whisper-base
+      AMUSE_SPEECH_MODEL: speaches-ai/Kokoro-82M-v1.0-ONNX
+      AMUSE_SPEECH_VOICE_MAP: '{"alloy": "af_heart", "echo": "am_michael", "fable": "bf_emma", "onyx": "am_adam", "nova": "af_bella", "shimmer": "af_sky", "coral": "af_sarah", "ash": "bm_george", "sage": "bf_isabella", "verse": "am_fenrir", "ballad": "af_nova"}'
+      AMUSE_IMAGE_MODEL: z-image-turbo
+      AMUSE_TERMINAL_URL: http://host.docker.internal:8124
+      AMUSE_WINDMILL_BASE_URL: http://your-server.local:8000
+      AMUSE_WINDMILL_WORKSPACE: starter
+      AMUSE_MCP_SERVERS: '[{"name":"composio","transport":"http","url":"http://host.docker.internal:18231/composio/mcp","headers":{"Authorization":"$$env:AMUSE_RELAY_AUTHORIZATION"},"enabled":true},{"name":"windmill","transport":"http","url":"http://your-server.local:8000/api/mcp","headers":{"Authorization":"$$env:AMUSE_WINDMILL_AUTH"},"enabled":true,"allowlist":["list_workspace_items","run_flow","run_script","get_run"]}]'
+    depends_on:
+      speaches:
+        condition: service_started

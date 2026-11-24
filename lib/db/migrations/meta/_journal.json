@@ -8,6 +8,27 @@
       "when": 1795048719893,
       "tag": "0000_init",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1795240000000,
+      "tag": "0001_mcp_servers",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1795360000000,
+      "tag": "0002_proactive_systems",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1795380000000,
+      "tag": "0003_documents",
+      "breakpoints": true
     }
   ]
 }
